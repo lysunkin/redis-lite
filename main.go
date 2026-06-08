@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"reditlite/resp"
+	"redislite/resp"
 )
 
 type Entry struct {
