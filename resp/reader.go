@@ -39,6 +39,9 @@ func Read(r *bufio.Reader) (Value, error) {
 	case '*': // Array
 		nstr, _ := readLine(r)
 		n, _ := strconv.Atoi(nstr)
+		if n == -1 {
+			return Value{T: Array, A: nil}, nil // Null array
+		}
 		arr := make([]Value, n)
 		for i := 0; i < n; i++ {
 			v, err := Read(r)
