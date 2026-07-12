@@ -33,6 +33,13 @@ func WriteBulk(w *bufio.Writer, b []byte) error {
 	return err
 }
 
+// WriteNullArray writes a RESP null array (*-1\r\n), used by EXEC when a
+// transaction is aborted due to a dirty WATCH.
+func WriteNullArray(w *bufio.Writer) error {
+	_, err := fmt.Fprint(w, "*-1\r\n")
+	return err
+}
+
 func WriteArray(w *bufio.Writer, arr []Value) error {
 	_, err := fmt.Fprintf(w, "*%d\r\n", len(arr))
 	if err != nil {
