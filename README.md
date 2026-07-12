@@ -1,4 +1,4 @@
-# redis-lite — Handoff
+# redis-lite — read me
 
 A lightweight Redis-compatible server written in Go. It speaks the RESP protocol on port **6379** and stores all data in-memory.
 
