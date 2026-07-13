@@ -2,10 +2,67 @@
 
 A lightweight Redis-compatible server written in Go. It speaks the RESP protocol on port **6379** and stores all data in-memory.
 
-## Running
+## Development
 
+### Prerequisites
+
+- Go 1.21+
+- `golangci-lint` (see [Install linter](#install-linter) below)
+
+### Make targets
+
+| Target | Description |
+|--------|-------------|
+| `make` | Build, test, and lint in sequence (default) |
+| `make build` | Compile the binary to `bin/redis-lite` |
+| `make test` | Run all tests with the race detector |
+| `make test-v` | Same as `test` but with verbose output |
+| `make lint` | Run `golangci-lint` across all packages |
+| `make run` | Build then start the server on `:6379` |
+| `make clean` | Remove the `bin/` directory |
+| `make install-lint` | Install `golangci-lint` via Homebrew (macOS) |
+
+### Install linter
+
+```sh
+make install-lint
 ```
+
+Or manually via Homebrew:
+
+```sh
+brew install golangci-lint
+```
+
+### Build
+
+```sh
+make build
+```
+
+### Run
+
+```sh
+make run
+```
+
+Or without Make:
+
+```sh
 go run .
+```
+
+### Test
+
+```sh
+make test        # concise output
+make test-v      # verbose output
+```
+
+### Lint
+
+```sh
+make lint
 ```
 
 ## Supported Commands
@@ -62,10 +119,12 @@ If another client modifies `balance` between `WATCH` and `EXEC`, `EXEC` returns 
 
 ## Internals
 
-- All data lives in a `map[string]Entry` protected by a `sync.RWMutex`.
-- A background janitor goroutine runs every second to evict expired keys.
-- `WATCH` is implemented via per-key monotonic version counters that are incremented on every write or delete.
-- Transaction state (`MULTI`/`WATCH` queue) is per-connection and never shared between goroutines.
+- Key/value data lives in a `map[string]entry` protected by a `sync.RWMutex`.
+- A separate `map[string]uint64` tracks monotonically increasing version counters per key; versions survive deletions so that `WATCH` can detect a key being deleted.
+- A background janitor goroutine evicts expired keys in batches of 20 per second to keep lock-hold time bounded.
+- `WATCH` snapshots each key's version at call time and compares it at `EXEC`; any write (including `EXPIRE` and `DEL`) to a watched key aborts the transaction.
+- Transaction state (`MULTI` queue, watched keys) is per-connection and never shared between goroutines.
+- Incoming connections are capped at 1000 concurrent clients via a buffered channel semaphore.
 
 ## Test Script
 

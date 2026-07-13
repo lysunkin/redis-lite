@@ -197,7 +197,7 @@ func TestStore_VersionBumpsOnSet(t *testing.T) {
 	v1 := st.getVersion("k")
 	st.set("k", []byte("b"), 0)
 	v2 := st.getVersion("k")
-	if !(v0 < v1 && v1 < v2) {
+	if v0 >= v1 || v1 >= v2 {
 		t.Fatalf("versions not strictly increasing: %d %d %d", v0, v1, v2)
 	}
 }
