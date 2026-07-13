@@ -2,9 +2,10 @@ package main
 
 import (
 	"bufio"
-	"bytes"
+	"fmt"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,56 +17,78 @@ import (
 // Store
 // ---------------------------------------------------------------------------
 
-type Entry struct {
+// entry holds a single key's value and optional expiry.
+type entry struct {
 	val []byte
-	exp int64 // unix ms, 0 means no expiry
+	exp int64 // unix ms; 0 means no expiry
 }
 
-// Store holds all key/value data plus a version counter per key used by WATCH.
-// A version is bumped every time a key is written or deleted.
+// Store is the in-memory key/value store. All operations are safe for
+// concurrent use.
+//
+// versions is kept as a separate map from data so that version numbers survive
+// key deletions. This is what allows WATCH to detect that a key was deleted
+// between WATCH and EXEC: the version is bumped on delete and persists even
+// though the data entry is gone. The two maps are always written together
+// inside a Lock, which the Store's own methods enforce — callers must use the
+// provided methods and never access the fields directly.
 type Store struct {
 	mu       sync.RWMutex
-	data     map[string]Entry
-	versions map[string]uint64 // monotonically increasing write counter per key
+	data     map[string]entry
+	versions map[string]uint64 // monotonically increasing; never deleted
 }
 
-func (s *Store) get(key string) (Entry, bool) {
+func newStoreImpl() *Store {
+	return &Store{
+		data:     make(map[string]entry),
+		versions: make(map[string]uint64),
+	}
+}
+
+// get returns the entry for key if it exists and has not expired.
+func (s *Store) get(key string) (entry, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	return s.lockedGet(key)
+}
 
+// lockedGet is the read path without locking; callers must hold at least RLock.
+func (s *Store) lockedGet(key string) (entry, bool) {
 	e, ok := s.data[key]
 	if !ok {
-		return Entry{}, false
+		return entry{}, false
 	}
 	if e.exp > 0 && time.Now().UnixMilli() > e.exp {
-		return Entry{}, false
+		return entry{}, false
 	}
 	return e, true
 }
 
 // getVersion returns the current write-version for a key (0 if never written).
-// Caller must NOT hold the lock.
 func (s *Store) getVersion(key string) uint64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.versions[key]
 }
 
+// set writes key with the given value and TTL. ttlMs == 0 means no expiry.
 func (s *Store) set(key string, val []byte, ttlMs int64) {
 	exp := int64(0)
 	if ttlMs > 0 {
 		exp = time.Now().UnixMilli() + ttlMs
 	}
 	s.mu.Lock()
-	s.data[key] = Entry{val: val, exp: exp}
+	s.data[key] = entry{val: val, exp: exp}
 	s.versions[key]++
 	s.mu.Unlock()
 }
 
+// del removes one or more keys and returns the count of keys that existed.
+// The version is bumped for each deleted key so that WATCH detects the change
+// even after the data entry is gone.
 func (s *Store) del(keys ...string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
 	n := 0
 	for _, k := range keys {
 		if _, ok := s.data[k]; ok {
@@ -77,16 +100,52 @@ func (s *Store) del(keys ...string) int {
 	return n
 }
 
+// expire sets a TTL (in milliseconds) on an existing key. Returns 1 if the key
+// existed, 0 otherwise. The version is bumped so that WATCH detects the change.
+func (s *Store) expire(key string, ttlMs int64) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.data[key]
+	if !ok {
+		return 0
+	}
+	e.exp = time.Now().UnixMilli() + ttlMs
+	s.data[key] = e
+	s.versions[key]++
+	return 1
+}
+
+// ttl returns the remaining TTL for a key in seconds, or the Redis sentinel
+// values: -1 (no expiry), -2 (key missing / expired). The entire read is done
+// under a single RLock to avoid a TOCTOU race between reading the entry and
+// calling time.Now().
+func (s *Store) ttl(key string) int64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e, ok := s.lockedGet(key)
+	if !ok {
+		return -2
+	}
+	if e.exp == 0 {
+		return -1
+	}
+	ms := e.exp - time.Now().UnixMilli()
+	if ms <= 0 {
+		return -2
+	}
+	return ms / 1000
+}
+
 // ---------------------------------------------------------------------------
 // Per-connection transaction state
 // ---------------------------------------------------------------------------
 
 // txState tracks everything needed for a single client's MULTI/EXEC block.
+// It is purely per-connection and never shared between goroutines.
 type txState struct {
-	active bool         // inside a MULTI block
-	queue  []resp.Value // queued raw command arrays
-	// watched maps key -> version at the time WATCH was called
-	watched map[string]uint64
+	active  bool              // inside a MULTI block
+	queue   []resp.Value      // queued raw command arrays
+	watched map[string]uint64 // key → version at WATCH time
 }
 
 func newTxState() *txState {
@@ -103,7 +162,7 @@ func (tx *txState) isDirty(st *Store) bool {
 	return false
 }
 
-// reset clears the transaction state but keeps the struct reusable.
+// reset clears all transaction state, reusing the struct allocation.
 func (tx *txState) reset() {
 	tx.active = false
 	tx.queue = tx.queue[:0]
@@ -111,15 +170,14 @@ func (tx *txState) reset() {
 }
 
 // ---------------------------------------------------------------------------
-// Main / connection handler
+// Main / connection handling
 // ---------------------------------------------------------------------------
 
-func main() {
-	st := &Store{
-		data:     make(map[string]Entry),
-		versions: make(map[string]uint64),
-	}
+// maxConns caps the number of simultaneously open client connections.
+const maxConns = 1000
 
+func main() {
+	st := newStoreImpl()
 	startJanitor(st, time.Second)
 
 	ln, err := net.Listen("tcp", ":6379")
@@ -128,13 +186,28 @@ func main() {
 	}
 	log.Println("redis-lite listening on :6379")
 
+	sem := make(chan struct{}, maxConns)
+
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			log.Println("accept:", err)
 			continue
 		}
-		go handleConn(conn, st)
+
+		// Try to acquire a slot without blocking. If full, reject immediately.
+		select {
+		case sem <- struct{}{}:
+		default:
+			log.Println("max connections reached, rejecting")
+			_ = conn.Close()
+			continue
+		}
+
+		go func() {
+			defer func() { <-sem }()
+			handleConn(conn, st)
+		}()
 	}
 }
 
@@ -151,37 +224,46 @@ func handleConn(conn net.Conn, st *Store) {
 			return
 		}
 		if val.T != resp.Array || len(val.A) == 0 {
-			_ = resp.WriteError(w, "ERR protocol error")
-			_ = w.Flush()
+			if err := resp.WriteError(w, "ERR protocol error"); err != nil {
+				return
+			}
+			if err := w.Flush(); err != nil {
+				return
+			}
 			continue
 		}
 
 		cmd := strings.ToUpper(string(val.A[0].B))
 
 		// Transaction-control commands are never queued — they execute immediately.
+		var writeErr error
 		switch cmd {
 		case "MULTI":
-			handleMulti(w, tx)
+			writeErr = handleMulti(w, tx)
 		case "EXEC":
-			handleExec(w, st, tx)
+			writeErr = handleExec(w, st, tx)
 		case "DISCARD":
-			handleDiscard(w, tx)
+			writeErr = handleDiscard(w, tx)
 		case "WATCH":
-			handleWatch(w, st, tx, val.A)
+			writeErr = handleWatch(w, st, tx, val.A)
 		case "UNWATCH":
-			handleUnwatch(w, tx)
+			writeErr = handleUnwatch(w, tx)
 		default:
 			if tx.active {
-				// Queue the command for later execution.
 				tx.queue = append(tx.queue, val)
-				_ = resp.WriteSimpleString(w, "QUEUED")
+				writeErr = resp.WriteSimpleString(w, "QUEUED")
 			} else {
-				// Normal (non-transactional) execution.
-				executeCommand(w, st, cmd, val.A)
+				result := executeCommand(st, cmd, val.A)
+				writeErr = resp.WriteValue(w, result)
 			}
 		}
 
-		_ = w.Flush()
+		if writeErr != nil {
+			return
+		}
+		if err := w.Flush(); err != nil {
+			return
+		}
 	}
 }
 
@@ -189,272 +271,239 @@ func handleConn(conn net.Conn, st *Store) {
 // Command dispatch
 // ---------------------------------------------------------------------------
 
-// executeCommand runs a single command against the store and writes the result
-// to w.  It is called both during normal operation and during EXEC replay.
-func executeCommand(w *bufio.Writer, st *Store, cmd string, args []resp.Value) {
+// executeCommand runs a single command against the store and returns the result
+// as a resp.Value. It is called both during normal operation and during EXEC
+// replay. Returning a value (rather than writing directly) eliminates the
+// encode-decode round-trip that was previously needed inside handleExec.
+func executeCommand(st *Store, cmd string, args []resp.Value) resp.Value {
 	switch cmd {
 	case "PING":
 		if len(args) > 1 {
-			_ = resp.WriteBulk(w, args[1].B)
-		} else {
-			_ = resp.WriteSimpleString(w, "PONG")
+			return resp.Value{T: resp.BulkString, B: args[1].B}
 		}
+		return resp.Value{T: resp.SimpleString, S: "PONG"}
+
 	case "ECHO":
 		if len(args) != 2 || args[1].T != resp.BulkString {
-			_ = resp.WriteError(w, "ERR wrong number of arguments for 'echo'")
-			return
+			return errReply("ERR wrong number of arguments for 'echo'")
 		}
-		_ = resp.WriteBulk(w, args[1].B)
+		return resp.Value{T: resp.BulkString, B: args[1].B}
+
 	case "SET":
-		handleSet(w, st, args)
+		return handleSet(st, args)
 	case "GET":
-		handleGet(w, st, args)
+		return handleGet(st, args)
 	case "DEL":
-		handleDel(w, st, args)
+		return handleDel(st, args)
 	case "EXPIRE":
-		handleExpire(w, st, args)
+		return handleExpire(st, args)
 	case "TTL":
-		handleTTL(w, st, args)
+		return handleTTL(st, args)
+
 	default:
-		_ = resp.WriteError(w, "ERR unknown command '"+cmd+"'")
+		return errReply("ERR unknown command '" + cmd + "'")
 	}
 }
 
+// errReply is a convenience constructor for error values.
+func errReply(msg string) resp.Value {
+	return resp.Value{T: resp.Error, S: msg}
+}
+
+// intReply is a convenience constructor for integer values.
+func intReply(n int64) resp.Value {
+	return resp.Value{T: resp.Integer, I: n}
+}
+
+// okReply is the canonical +OK response.
+func okReply() resp.Value {
+	return resp.Value{T: resp.SimpleString, S: "OK"}
+}
+
+// nullBulk is the canonical null bulk string ($-1).
+func nullBulk() resp.Value {
+	return resp.Value{T: resp.BulkString, B: nil}
+}
+
 // ---------------------------------------------------------------------------
-// Transaction handlers
+// Transaction handlers — now return error instead of taking *bufio.Writer
+// directly for the write path, but still need the writer for composite
+// responses (EXEC array). Simple responses go through the caller in handleConn.
 // ---------------------------------------------------------------------------
 
-func handleMulti(w *bufio.Writer, tx *txState) {
+func handleMulti(w *bufio.Writer, tx *txState) error {
 	if tx.active {
-		_ = resp.WriteError(w, "ERR MULTI calls can not be nested")
-		return
+		return resp.WriteError(w, "ERR MULTI calls can not be nested")
 	}
 	tx.active = true
-	_ = resp.WriteSimpleString(w, "OK")
+	return resp.WriteSimpleString(w, "OK")
 }
 
-func handleExec(w *bufio.Writer, st *Store, tx *txState) {
+func handleExec(w *bufio.Writer, st *Store, tx *txState) error {
 	if !tx.active {
-		_ = resp.WriteError(w, "ERR EXEC without MULTI")
-		return
+		return resp.WriteError(w, "ERR EXEC without MULTI")
 	}
 
 	// If any watched key was modified, abort and return a null array.
 	if tx.isDirty(st) {
 		tx.reset()
-		_ = resp.WriteNullArray(w)
-		return
+		return resp.WriteNullArray(w)
 	}
 
-	// Execute all queued commands and collect results.
-	results := make([]resp.Value, 0, len(tx.queue))
-
-	for _, queued := range tx.queue {
+	// Execute all queued commands and collect results directly as resp.Values —
+	// no encode/decode round-trip needed.
+	results := make([]resp.Value, len(tx.queue))
+	for i, queued := range tx.queue {
 		cmd := strings.ToUpper(string(queued.A[0].B))
-
-		// Capture the response for this command into a temporary buffer.
-		capture := newCaptureWriter()
-		bw := capture.asBufioWriter()
-		executeCommand(bw, st, cmd, queued.A)
-		_ = bw.Flush()
-
-		// Parse the captured bytes back into a resp.Value so we can embed it
-		// in the outer array response.
-		v, parseErr := resp.Read(bufio.NewReader(capture.Reader()))
-		if parseErr != nil {
-			results = append(results, resp.Value{T: resp.Error, S: "ERR internal error"})
-		} else {
-			results = append(results, v)
-		}
+		results[i] = executeCommand(st, cmd, queued.A)
 	}
 
 	tx.reset()
-
-	_ = resp.WriteArray(w, results)
+	return resp.WriteArray(w, results)
 }
 
-func handleDiscard(w *bufio.Writer, tx *txState) {
+func handleDiscard(w *bufio.Writer, tx *txState) error {
 	if !tx.active {
-		_ = resp.WriteError(w, "ERR DISCARD without MULTI")
-		return
+		return resp.WriteError(w, "ERR DISCARD without MULTI")
 	}
 	tx.reset()
-	_ = resp.WriteSimpleString(w, "OK")
+	return resp.WriteSimpleString(w, "OK")
 }
 
-func handleWatch(w *bufio.Writer, st *Store, tx *txState, args []resp.Value) {
+func handleWatch(w *bufio.Writer, st *Store, tx *txState, args []resp.Value) error {
 	if tx.active {
-		_ = resp.WriteError(w, "ERR WATCH inside MULTI is not allowed")
-		return
+		return resp.WriteError(w, "ERR WATCH inside MULTI is not allowed")
 	}
 	if len(args) < 2 {
-		_ = resp.WriteError(w, "ERR wrong number of arguments for 'watch'")
-		return
+		return resp.WriteError(w, "ERR wrong number of arguments for 'watch'")
 	}
 	for _, a := range args[1:] {
 		key := string(a.B)
 		tx.watched[key] = st.getVersion(key)
 	}
-	_ = resp.WriteSimpleString(w, "OK")
+	return resp.WriteSimpleString(w, "OK")
 }
 
-func handleUnwatch(w *bufio.Writer, tx *txState) {
+func handleUnwatch(w *bufio.Writer, tx *txState) error {
 	tx.watched = make(map[string]uint64)
-	_ = resp.WriteSimpleString(w, "OK")
+	return resp.WriteSimpleString(w, "OK")
 }
 
 // ---------------------------------------------------------------------------
-// captureWriter — thin buffer that lets us round-trip a RESP response
+// Command handlers — return resp.Value, no I/O
 // ---------------------------------------------------------------------------
 
-// captureWriter wraps a byte slice so executeCommand can write into it and we
-// can then re-parse the result with resp.Read.
-type captureWriter struct {
-	buf []byte
-	pos int
-}
-
-func newCaptureWriter() *captureWriter { return &captureWriter{} }
-
-// bufio.Writer expects an io.Writer.
-func (c *captureWriter) Write(p []byte) (int, error) {
-	c.buf = append(c.buf, p...)
-	return len(p), nil
-}
-
-// Reader returns an io.Reader over the captured bytes.
-func (c *captureWriter) Reader() *bytes.Reader {
-	return bytes.NewReader(c.buf)
-}
-
-// asBufioWriter wraps the captureWriter in a *bufio.Writer for use with our
-// resp helpers (which all take *bufio.Writer).
-func (c *captureWriter) asBufioWriter() *bufio.Writer {
-	return bufio.NewWriter(c)
-}
-
-// ---------------------------------------------------------------------------
-// Existing command handlers (unchanged except executeCommand calling them)
-// ---------------------------------------------------------------------------
-
-func handleSet(w *bufio.Writer, st *Store, args []resp.Value) {
+func handleSet(st *Store, args []resp.Value) resp.Value {
 	if len(args) < 3 {
-		_ = resp.WriteError(w, "ERR wrong number of arguments for 'set'")
-		return
+		return errReply("ERR wrong number of arguments for 'set'")
 	}
 	key := string(args[1].B)
 	val := args[2].B
+
 	var ttlMs int64
 	if len(args) >= 5 {
 		opt := strings.ToUpper(string(args[3].B))
-		if opt == "EX" {
-			ttlMs = parseIntMs(args[4].B, 1000)
+		n, err := parseInteger(args[4].B)
+		if err != nil || n <= 0 {
+			return errReply("ERR value is not an integer or out of range")
 		}
-		if opt == "PX" {
-			ttlMs = parseIntMs(args[4].B, 1)
+		switch opt {
+		case "EX":
+			ttlMs = n * 1000
+		case "PX":
+			ttlMs = n
 		}
 	}
+
 	st.set(key, val, ttlMs)
-	_ = resp.WriteSimpleString(w, "OK")
+	return okReply()
 }
 
-func handleGet(w *bufio.Writer, st *Store, args []resp.Value) {
+func handleGet(st *Store, args []resp.Value) resp.Value {
 	if len(args) != 2 {
-		_ = resp.WriteError(w, "ERR wrong number of arguments for 'get'")
-		return
+		return errReply("ERR wrong number of arguments for 'get'")
 	}
-	key := string(args[1].B)
-	e, ok := st.get(key)
+	e, ok := st.get(string(args[1].B))
 	if !ok {
-		_ = resp.WriteBulk(w, nil)
-		return
+		return nullBulk()
 	}
-	_ = resp.WriteBulk(w, e.val)
+	return resp.Value{T: resp.BulkString, B: e.val}
 }
 
-func handleDel(w *bufio.Writer, st *Store, args []resp.Value) {
+func handleDel(st *Store, args []resp.Value) resp.Value {
 	if len(args) < 2 {
-		_ = resp.WriteError(w, "ERR wrong number of arguments for 'del'")
-		return
+		return errReply("ERR wrong number of arguments for 'del'")
 	}
-	keys := make([]string, 0, len(args)-1)
-	for _, a := range args[1:] {
-		keys = append(keys, string(a.B))
+	keys := make([]string, len(args)-1)
+	for i, a := range args[1:] {
+		keys[i] = string(a.B)
 	}
-	n := st.del(keys...)
-	_ = resp.WriteInteger(w, int64(n))
+	return intReply(int64(st.del(keys...)))
 }
 
-func handleExpire(w *bufio.Writer, st *Store, args []resp.Value) {
+func handleExpire(st *Store, args []resp.Value) resp.Value {
 	if len(args) != 3 {
-		_ = resp.WriteError(w, "ERR wrong number of arguments for 'expire'")
-		return
+		return errReply("ERR wrong number of arguments for 'expire'")
 	}
-	key := string(args[1].B)
-	secs := parseIntMs(args[2].B, 1000)
-
-	st.mu.Lock()
-	if e, ok := st.data[key]; ok {
-		e.exp = time.Now().UnixMilli() + secs
-		st.data[key] = e
-		_ = resp.WriteInteger(w, 1)
-	} else {
-		_ = resp.WriteInteger(w, 0)
+	n, err := parseInteger(args[2].B)
+	if err != nil || n < 0 {
+		return errReply("ERR value is not an integer or out of range")
 	}
-	st.mu.Unlock()
+	return intReply(int64(st.expire(string(args[1].B), n*1000)))
 }
 
-func handleTTL(w *bufio.Writer, st *Store, args []resp.Value) {
+func handleTTL(st *Store, args []resp.Value) resp.Value {
 	if len(args) != 2 {
-		_ = resp.WriteError(w, "ERR wrong number of arguments for 'ttl'")
-		return
+		return errReply("ERR wrong number of arguments for 'ttl'")
 	}
-
-	st.mu.RLock()
-	e, ok := st.data[string(args[1].B)]
-	st.mu.RUnlock()
-
-	if !ok {
-		_ = resp.WriteInteger(w, -2)
-		return
-	}
-	if e.exp == 0 {
-		_ = resp.WriteInteger(w, -1)
-		return
-	}
-	ms := e.exp - time.Now().UnixMilli()
-	if ms < 0 {
-		_ = resp.WriteInteger(w, -2)
-		return
-	}
-	_ = resp.WriteInteger(w, ms/1000)
+	return intReply(st.ttl(string(args[1].B)))
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-func parseIntMs(b []byte, mul int64) int64 {
-	var n int64
-	for _, c := range b {
-		n = n*10 + int64(c-'0')
+// parseInteger parses a decimal integer from a byte slice. Returns an error for
+// any non-numeric or out-of-range input, replacing the old silent-corruption bug.
+func parseInteger(b []byte) (int64, error) {
+	if len(b) == 0 {
+		return 0, fmt.Errorf("empty integer")
 	}
-	return n * mul
+	n, err := strconv.ParseInt(string(b), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("value is not an integer or out of range")
+	}
+	return n, nil
 }
 
+// startJanitor launches a background goroutine that evicts expired keys in
+// small batches (up to batchSize random keys per tick) to avoid holding the
+// store lock for an unbounded duration.
 func startJanitor(st *Store, every time.Duration) {
+	const batchSize = 20
 	go func() {
 		t := time.NewTicker(every)
 		defer t.Stop()
 		for range t.C {
-			now := time.Now().UnixMilli()
-			st.mu.Lock()
-			for k, e := range st.data {
-				if e.exp > 0 && now > e.exp {
-					delete(st.data, k)
-				}
-			}
-			st.mu.Unlock()
+			evictBatch(st, batchSize)
 		}
 	}()
+}
+
+func evictBatch(st *Store, max int) {
+	now := time.Now().UnixMilli()
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	n := 0
+	for k, e := range st.data {
+		if n >= max {
+			break
+		}
+		if e.exp > 0 && now > e.exp {
+			delete(st.data, k)
+			st.versions[k]++
+			n++
+		}
+	}
 }

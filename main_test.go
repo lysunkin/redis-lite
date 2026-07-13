@@ -15,26 +15,15 @@ import (
 // ---------------------------------------------------------------------------
 
 // newStore returns a clean, empty Store ready for testing.
+// Uses newStoreImpl() to match the refactored constructor.
 func newStore() *Store {
-	return &Store{
-		data:     make(map[string]Entry),
-		versions: make(map[string]uint64),
-	}
+	return newStoreImpl()
 }
 
-// run sends args as a command to executeCommand and returns the parsed response.
+// run calls executeCommand (which now returns resp.Value) and returns it.
 func run(t *testing.T, st *Store, args ...string) resp.Value {
 	t.Helper()
-	vals := makeArgs(args...)
-	var buf bytes.Buffer
-	w := bufio.NewWriter(&buf)
-	executeCommand(w, st, strings.ToUpper(args[0]), vals)
-	_ = w.Flush()
-	v, err := resp.Read(bufio.NewReader(&buf))
-	if err != nil {
-		t.Fatalf("run(%v): parse error: %v (raw: %q)", args, err, buf.Bytes())
-	}
-	return v
+	return executeCommand(st, strings.ToUpper(args[0]), makeArgs(args...))
 }
 
 // makeArgs converts string slices into []resp.Value bulk strings.
@@ -46,39 +35,18 @@ func makeArgs(args ...string) []resp.Value {
 	return vals
 }
 
-// runTx calls a transaction handler and returns the parsed response.
-func runMulti(t *testing.T, tx *txState) resp.Value {
-	t.Helper()
-	return txRun(t, func(w *bufio.Writer) { handleMulti(w, tx) })
-}
-
-func runExec(t *testing.T, st *Store, tx *txState) resp.Value {
-	t.Helper()
-	return txRun(t, func(w *bufio.Writer) { handleExec(w, st, tx) })
-}
-
-func runDiscard(t *testing.T, tx *txState) resp.Value {
-	t.Helper()
-	return txRun(t, func(w *bufio.Writer) { handleDiscard(w, tx) })
-}
-
-func runWatch(t *testing.T, st *Store, tx *txState, keys ...string) resp.Value {
-	t.Helper()
-	args := append([]resp.Value{{T: resp.BulkString, B: []byte("WATCH")}}, makeArgs(keys...)...)
-	return txRun(t, func(w *bufio.Writer) { handleWatch(w, st, tx, args) })
-}
-
-func runUnwatch(t *testing.T, tx *txState) resp.Value {
-	t.Helper()
-	return txRun(t, func(w *bufio.Writer) { handleUnwatch(w, tx) })
-}
-
-func txRun(t *testing.T, fn func(*bufio.Writer)) resp.Value {
+// txRun calls a transaction handler (which writes to a bufio.Writer and returns
+// an error) and returns the parsed resp.Value response.
+func txRun(t *testing.T, fn func(*bufio.Writer) error) resp.Value {
 	t.Helper()
 	var buf bytes.Buffer
 	w := bufio.NewWriter(&buf)
-	fn(w)
-	_ = w.Flush()
+	if err := fn(w); err != nil {
+		t.Fatalf("txRun: handler error: %v", err)
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatalf("txRun: flush error: %v", err)
+	}
 	v, err := resp.Read(bufio.NewReader(&buf))
 	if err != nil {
 		t.Fatalf("txRun: parse error: %v (raw: %q)", err, buf.Bytes())
@@ -86,7 +54,36 @@ func txRun(t *testing.T, fn func(*bufio.Writer)) resp.Value {
 	return v
 }
 
-// assertOK fails if v is not a SimpleString "OK".
+func runMulti(t *testing.T, tx *txState) resp.Value {
+	t.Helper()
+	return txRun(t, func(w *bufio.Writer) error { return handleMulti(w, tx) })
+}
+
+func runExec(t *testing.T, st *Store, tx *txState) resp.Value {
+	t.Helper()
+	return txRun(t, func(w *bufio.Writer) error { return handleExec(w, st, tx) })
+}
+
+func runDiscard(t *testing.T, tx *txState) resp.Value {
+	t.Helper()
+	return txRun(t, func(w *bufio.Writer) error { return handleDiscard(w, tx) })
+}
+
+func runWatch(t *testing.T, st *Store, tx *txState, keys ...string) resp.Value {
+	t.Helper()
+	args := append([]resp.Value{{T: resp.BulkString, B: []byte("WATCH")}}, makeArgs(keys...)...)
+	return txRun(t, func(w *bufio.Writer) error { return handleWatch(w, st, tx, args) })
+}
+
+func runUnwatch(t *testing.T, tx *txState) resp.Value {
+	t.Helper()
+	return txRun(t, func(w *bufio.Writer) error { return handleUnwatch(w, tx) })
+}
+
+// ---------------------------------------------------------------------------
+// Assertion helpers
+// ---------------------------------------------------------------------------
+
 func assertOK(t *testing.T, v resp.Value) {
 	t.Helper()
 	if v.T != resp.SimpleString || v.S != "OK" {
@@ -94,7 +91,6 @@ func assertOK(t *testing.T, v resp.Value) {
 	}
 }
 
-// assertError fails if v is not an Error containing substr.
 func assertError(t *testing.T, v resp.Value, substr string) {
 	t.Helper()
 	if v.T != resp.Error || !strings.Contains(v.S, substr) {
@@ -102,7 +98,6 @@ func assertError(t *testing.T, v resp.Value, substr string) {
 	}
 }
 
-// assertBulk fails if v is not a BulkString with the given value.
 func assertBulk(t *testing.T, v resp.Value, want string) {
 	t.Helper()
 	if v.T != resp.BulkString || string(v.B) != want {
@@ -110,7 +105,6 @@ func assertBulk(t *testing.T, v resp.Value, want string) {
 	}
 }
 
-// assertNullBulk fails if v is not a null BulkString.
 func assertNullBulk(t *testing.T, v resp.Value) {
 	t.Helper()
 	if v.T != resp.BulkString || v.B != nil {
@@ -118,7 +112,6 @@ func assertNullBulk(t *testing.T, v resp.Value) {
 	}
 }
 
-// assertInteger fails if v is not an Integer with the given value.
 func assertInteger(t *testing.T, v resp.Value, want int64) {
 	t.Helper()
 	if v.T != resp.Integer || v.I != want {
@@ -126,7 +119,6 @@ func assertInteger(t *testing.T, v resp.Value, want int64) {
 	}
 }
 
-// assertNullArray fails if v is not a null array (*-1).
 func assertNullArray(t *testing.T, v resp.Value) {
 	t.Helper()
 	// resp.Read represents *-1 as an Array with nil slice.
@@ -152,8 +144,7 @@ func TestStore_SetGet(t *testing.T) {
 }
 
 func TestStore_GetMissing(t *testing.T) {
-	st := newStore()
-	_, ok := st.get("missing")
+	_, ok := newStore().get("missing")
 	if ok {
 		t.Fatal("expected key to be absent")
 	}
@@ -173,8 +164,7 @@ func TestStore_Del_Existing(t *testing.T) {
 	st := newStore()
 	st.set("a", []byte("1"), 0)
 	st.set("b", []byte("2"), 0)
-	n := st.del("a", "b", "missing")
-	if n != 2 {
+	if n := st.del("a", "b", "missing"); n != 2 {
 		t.Fatalf("expected 2 deletions, got %d", n)
 	}
 	if _, ok := st.get("a"); ok {
@@ -183,9 +173,7 @@ func TestStore_Del_Existing(t *testing.T) {
 }
 
 func TestStore_Del_Missing(t *testing.T) {
-	st := newStore()
-	n := st.del("nope")
-	if n != 0 {
+	if n := newStore().del("nope"); n != 0 {
 		t.Fatalf("expected 0, got %d", n)
 	}
 }
@@ -194,7 +182,7 @@ func TestStore_Expiry(t *testing.T) {
 	st := newStore()
 	st.set("k", []byte("v"), 50) // 50 ms TTL
 	if _, ok := st.get("k"); !ok {
-		t.Fatal("key should still be alive")
+		t.Fatal("key should still be alive immediately after set")
 	}
 	time.Sleep(60 * time.Millisecond)
 	if _, ok := st.get("k"); ok {
@@ -219,9 +207,58 @@ func TestStore_VersionBumpsOnDel(t *testing.T) {
 	st.set("k", []byte("a"), 0)
 	vBefore := st.getVersion("k")
 	st.del("k")
-	vAfter := st.getVersion("k")
-	if vAfter <= vBefore {
+	if vAfter := st.getVersion("k"); vAfter <= vBefore {
 		t.Fatalf("version should increase on delete: before=%d after=%d", vBefore, vAfter)
+	}
+}
+
+func TestStore_Expire_BumpsVersion(t *testing.T) {
+	st := newStore()
+	st.set("k", []byte("v"), 0)
+	vBefore := st.getVersion("k")
+	if n := st.expire("k", 10_000); n != 1 {
+		t.Fatalf("expected expire to return 1, got %d", n)
+	}
+	if vAfter := st.getVersion("k"); vAfter <= vBefore {
+		t.Fatalf("version should increase on expire: before=%d after=%d", vBefore, vAfter)
+	}
+}
+
+func TestStore_Expire_MissingKey(t *testing.T) {
+	if n := newStore().expire("nope", 1000); n != 0 {
+		t.Fatalf("expected 0 for missing key, got %d", n)
+	}
+}
+
+func TestStore_TTL_NoExpiry(t *testing.T) {
+	st := newStore()
+	st.set("k", []byte("v"), 0)
+	if ttl := st.ttl("k"); ttl != -1 {
+		t.Fatalf("expected -1 (no expiry), got %d", ttl)
+	}
+}
+
+func TestStore_TTL_MissingKey(t *testing.T) {
+	if ttl := newStore().ttl("gone"); ttl != -2 {
+		t.Fatalf("expected -2 (missing), got %d", ttl)
+	}
+}
+
+func TestStore_TTL_WithExpiry(t *testing.T) {
+	st := newStore()
+	st.set("k", []byte("v"), 100_000) // 100 s TTL
+	ttl := st.ttl("k")
+	if ttl < 99 || ttl > 100 {
+		t.Fatalf("expected TTL ~100, got %d", ttl)
+	}
+}
+
+func TestStore_TTL_Expired(t *testing.T) {
+	st := newStore()
+	st.set("k", []byte("v"), 30) // 30 ms
+	time.Sleep(40 * time.Millisecond)
+	if ttl := st.ttl("k"); ttl != -2 {
+		t.Fatalf("expected -2 for expired key, got %d", ttl)
 	}
 }
 
@@ -237,18 +274,15 @@ func TestPing_NoArg(t *testing.T) {
 }
 
 func TestPing_WithMessage(t *testing.T) {
-	v := run(t, newStore(), "PING", "hello")
-	assertBulk(t, v, "hello")
+	assertBulk(t, run(t, newStore(), "PING", "hello"), "hello")
 }
 
 func TestEcho(t *testing.T) {
-	v := run(t, newStore(), "ECHO", "world")
-	assertBulk(t, v, "world")
+	assertBulk(t, run(t, newStore(), "ECHO", "world"), "world")
 }
 
 func TestEcho_MissingArg(t *testing.T) {
-	v := run(t, newStore(), "ECHO")
-	assertError(t, v, "ERR")
+	assertError(t, run(t, newStore(), "ECHO"), "ERR")
 }
 
 // ---------------------------------------------------------------------------
@@ -274,14 +308,12 @@ func TestSet_OverwritesExisting(t *testing.T) {
 
 func TestSet_WithEX(t *testing.T) {
 	st := newStore()
-	// EX 1 → expires in 1 second; key should be alive immediately
 	assertOK(t, run(t, st, "SET", "k", "v", "EX", "1"))
 	assertBulk(t, run(t, st, "GET", "k"), "v")
 }
 
 func TestSet_WithPX(t *testing.T) {
 	st := newStore()
-	// PX 50 → expires in 50 ms
 	assertOK(t, run(t, st, "SET", "k", "v", "PX", "50"))
 	assertBulk(t, run(t, st, "GET", "k"), "v")
 	time.Sleep(60 * time.Millisecond)
@@ -294,6 +326,19 @@ func TestSet_MissingArgs(t *testing.T) {
 
 func TestGet_MissingArgs(t *testing.T) {
 	assertError(t, run(t, newStore(), "GET"), "ERR")
+}
+
+// New: bad integer argument for EX must return an error, not a corrupt TTL.
+func TestSet_BadEXValue(t *testing.T) {
+	assertError(t, run(t, newStore(), "SET", "k", "v", "EX", "abc"), "ERR")
+}
+
+func TestSet_ZeroEXValue(t *testing.T) {
+	assertError(t, run(t, newStore(), "SET", "k", "v", "EX", "0"), "ERR")
+}
+
+func TestSet_NegativeEXValue(t *testing.T) {
+	assertError(t, run(t, newStore(), "SET", "k", "v", "EX", "-5"), "ERR")
 }
 
 // ---------------------------------------------------------------------------
@@ -329,7 +374,7 @@ func TestDel_MissingArgs(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// EXPIRE / TTL
+// EXPIRE / TTL (command level)
 // ---------------------------------------------------------------------------
 
 func TestExpire_ExistingKey(t *testing.T) {
@@ -342,6 +387,10 @@ func TestExpire_MissingKey(t *testing.T) {
 	assertInteger(t, run(t, newStore(), "EXPIRE", "nope", "10"), 0)
 }
 
+func TestExpire_BadValue(t *testing.T) {
+	assertError(t, run(t, newStore(), "EXPIRE", "k", "notanumber"), "ERR")
+}
+
 func TestTTL_NoExpiry(t *testing.T) {
 	st := newStore()
 	run(t, st, "SET", "k", "v")
@@ -352,7 +401,6 @@ func TestTTL_WithExpiry(t *testing.T) {
 	st := newStore()
 	run(t, st, "SET", "k", "v", "EX", "100")
 	v := run(t, st, "TTL", "k")
-	// TTL should be close to 100 s; anything in [99, 100] is correct
 	if v.T != resp.Integer || v.I < 99 || v.I > 100 {
 		t.Fatalf("expected TTL ~100, got %d", v.I)
 	}
@@ -378,7 +426,7 @@ func TestUnknownCommand(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// Transaction: txState helpers
+// Transaction: txState unit tests
 // ---------------------------------------------------------------------------
 
 func TestTxState_IsDirty_Clean(t *testing.T) {
@@ -396,7 +444,7 @@ func TestTxState_IsDirty_AfterSet(t *testing.T) {
 	st.set("k", []byte("v"), 0)
 	tx := newTxState()
 	tx.watched["k"] = st.getVersion("k")
-	st.set("k", []byte("changed"), 0) // bump version
+	st.set("k", []byte("changed"), 0)
 	if !tx.isDirty(st) {
 		t.Fatal("should be dirty: key was modified")
 	}
@@ -410,6 +458,18 @@ func TestTxState_IsDirty_AfterDel(t *testing.T) {
 	st.del("k")
 	if !tx.isDirty(st) {
 		t.Fatal("should be dirty: key was deleted")
+	}
+}
+
+// New: EXPIRE bumps version, so a watched key that gets EXPIRE'd should be dirty.
+func TestTxState_IsDirty_AfterExpire(t *testing.T) {
+	st := newStore()
+	st.set("k", []byte("v"), 0)
+	tx := newTxState()
+	tx.watched["k"] = st.getVersion("k")
+	st.expire("k", 10_000)
+	if !tx.isDirty(st) {
+		t.Fatal("should be dirty: key had EXPIRE called on it")
 	}
 }
 
@@ -452,13 +512,11 @@ func TestDiscard_OK(t *testing.T) {
 }
 
 func TestDiscard_WithoutMulti(t *testing.T) {
-	tx := newTxState()
-	assertError(t, runDiscard(t, tx), "DISCARD without MULTI")
+	assertError(t, runDiscard(t, newTxState()), "DISCARD without MULTI")
 }
 
 func TestExec_WithoutMulti(t *testing.T) {
-	tx := newTxState()
-	assertError(t, runExec(t, newStore(), tx), "EXEC without MULTI")
+	assertError(t, runExec(t, newStore(), newTxState()), "EXEC without MULTI")
 }
 
 func TestExec_EmptyQueue(t *testing.T) {
@@ -478,21 +536,15 @@ func TestExec_ExecutesQueue(t *testing.T) {
 	st := newStore()
 	tx := newTxState()
 	runMulti(t, tx)
-
-	// Queue: SET foo hello, SET bar world
 	for _, args := range [][]string{{"SET", "foo", "hello"}, {"SET", "bar", "world"}} {
-		arr := makeArgs(args...)
-		tx.queue = append(tx.queue, resp.Value{T: resp.Array, A: arr})
+		tx.queue = append(tx.queue, resp.Value{T: resp.Array, A: makeArgs(args...)})
 	}
-
 	v := runExec(t, st, tx)
 	if v.T != resp.Array || len(v.A) != 2 {
 		t.Fatalf("expected array of 2, got T=%v len=%d", v.T, len(v.A))
 	}
 	assertOK(t, v.A[0])
 	assertOK(t, v.A[1])
-
-	// Values should actually be in the store
 	assertBulk(t, run(t, st, "GET", "foo"), "hello")
 	assertBulk(t, run(t, st, "GET", "bar"), "world")
 }
@@ -501,21 +553,17 @@ func TestExec_InlineError_DoesNotAbort(t *testing.T) {
 	st := newStore()
 	tx := newTxState()
 	runMulti(t, tx)
-
-	// Queue: SET k v (valid), FOOBAR (unknown command)
 	tx.queue = append(tx.queue,
 		resp.Value{T: resp.Array, A: makeArgs("SET", "k", "v")},
 		resp.Value{T: resp.Array, A: makeArgs("FOOBAR")},
 	)
-
 	v := runExec(t, st, tx)
 	if v.T != resp.Array || len(v.A) != 2 {
 		t.Fatalf("expected 2-element array, got T=%v len=%d", v.T, len(v.A))
 	}
 	assertOK(t, v.A[0])
 	assertError(t, v.A[1], "ERR")
-
-	// SET must have committed despite the following error
+	// SET must have committed despite the subsequent error
 	assertBulk(t, run(t, st, "GET", "k"), "v")
 }
 
@@ -553,38 +601,30 @@ func TestWatch_InsideMulti(t *testing.T) {
 func TestWatch_NoKeys(t *testing.T) {
 	st := newStore()
 	tx := newTxState()
-	// Pass only the command name, no key args
 	args := []resp.Value{{T: resp.BulkString, B: []byte("WATCH")}}
-	v := txRun(t, func(w *bufio.Writer) { handleWatch(w, st, tx, args) })
+	v := txRun(t, func(w *bufio.Writer) error { return handleWatch(w, st, tx, args) })
 	assertError(t, v, "ERR")
 }
 
 func TestWatch_DirtyAbort(t *testing.T) {
 	st := newStore()
 	st.set("mykey", []byte("100"), 0)
-
 	tx := newTxState()
 	runWatch(t, st, tx, "mykey")
 	runMulti(t, tx)
-
-	// Another "client" modifies the key
-	st.set("mykey", []byte("999"), 0)
-
-	v := runExec(t, st, tx)
-	assertNullArray(t, v)
+	st.set("mykey", []byte("999"), 0) // another "client" modifies the key
+	assertNullArray(t, runExec(t, st, tx))
 }
 
 func TestWatch_CleanCommit(t *testing.T) {
 	st := newStore()
 	st.set("mykey", []byte("100"), 0)
-
 	tx := newTxState()
 	runWatch(t, st, tx, "mykey")
 	runMulti(t, tx)
 	tx.queue = append(tx.queue,
 		resp.Value{T: resp.Array, A: makeArgs("SET", "mykey", "200")},
 	)
-
 	v := runExec(t, st, tx)
 	if v.T != resp.Array || len(v.A) != 1 {
 		t.Fatalf("expected 1-element array, got T=%v len=%d", v.T, len(v.A))
@@ -597,13 +637,21 @@ func TestWatch_MultipleKeys_OneDirty(t *testing.T) {
 	st := newStore()
 	st.set("a", []byte("1"), 0)
 	st.set("b", []byte("2"), 0)
-
 	tx := newTxState()
 	runWatch(t, st, tx, "a", "b")
 	runMulti(t, tx)
+	st.set("b", []byte("modified"), 0)
+	assertNullArray(t, runExec(t, st, tx))
+}
 
-	st.set("b", []byte("modified"), 0) // only b is dirty
-
+// New: EXPIRE on a watched key must abort the transaction.
+func TestWatch_DirtyAbort_ViaExpire(t *testing.T) {
+	st := newStore()
+	st.set("k", []byte("v"), 0)
+	tx := newTxState()
+	runWatch(t, st, tx, "k")
+	runMulti(t, tx)
+	st.expire("k", 60_000) // changes version
 	assertNullArray(t, runExec(t, st, tx))
 }
 
@@ -623,22 +671,45 @@ func TestUnwatch_ClearsWatched(t *testing.T) {
 func TestUnwatch_ThenDirtyKeyNoLongerAborts(t *testing.T) {
 	st := newStore()
 	st.set("k", []byte("v"), 0)
-
 	tx := newTxState()
 	runWatch(t, st, tx, "k")
-	runUnwatch(t, tx) // clear the watch
-
-	// Modify the key — but since we unwatched, it shouldn't matter
-	st.set("k", []byte("changed"), 0)
-
+	runUnwatch(t, tx)
+	st.set("k", []byte("changed"), 0) // would be dirty if still watched
 	runMulti(t, tx)
 	tx.queue = append(tx.queue,
 		resp.Value{T: resp.Array, A: makeArgs("SET", "k", "final")},
 	)
-
 	v := runExec(t, st, tx)
 	if v.T != resp.Array || len(v.A) != 1 {
 		t.Fatalf("expected commit after UNWATCH, got T=%v A=%v", v.T, v.A)
 	}
 	assertOK(t, v.A[0])
+}
+
+// ---------------------------------------------------------------------------
+// parseInteger
+// ---------------------------------------------------------------------------
+
+func TestParseInteger_Valid(t *testing.T) {
+	for _, tc := range []struct {
+		input string
+		want  int64
+	}{
+		{"0", 0},
+		{"42", 42},
+		{"9223372036854775807", 9223372036854775807},
+	} {
+		got, err := parseInteger([]byte(tc.input))
+		if err != nil || got != tc.want {
+			t.Errorf("parseInteger(%q) = %d, %v; want %d, nil", tc.input, got, err, tc.want)
+		}
+	}
+}
+
+func TestParseInteger_Invalid(t *testing.T) {
+	for _, input := range []string{"", "abc", "1.5", "1e3", " 1"} {
+		if _, err := parseInteger([]byte(input)); err == nil {
+			t.Errorf("parseInteger(%q) expected error, got nil", input)
+		}
+	}
 }
